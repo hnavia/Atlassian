@@ -1,0 +1,57 @@
+name: Build macOS Executable
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare-dropdown:
+    runs-on: ubuntu-latest
+    outputs:
+      script-options: ${{ steps.generate.outputs.scripts }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Generate script list
+        id: generate
+        run: |
+          echo "Generating list of scripts in Standalone..."
+          SCRIPTS=$(find Standalone -name '*.py' | sort | paste -sd ',' -)
+          echo "scripts=$SCRIPTS" >> $GITHUB_OUTPUT
+          echo "Available scripts: $SCRIPTS"
+
+  build-macos:
+    needs: prepare-dropdown
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.13
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Choose script to build
+        run: |
+          echo "Available scripts in Standalone:"
+          echo "${{ needs.prepare-dropdown.outputs.script-options }}" | tr ',' '\n'
+          echo "Enter the script to build exactly as shown above:"
+          read SCRIPT_TO_BUILD
+          echo "Script chosen: $SCRIPT_TO_BUILD"
+          echo "SCRIPT_TO_BUILD=$SCRIPT_TO_BUILD" >> $GITHUB_ENV
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile "$SCRIPT_TO_BUILD" --distpath Standalone
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: macOS-executable
+          path: Standalone/*
