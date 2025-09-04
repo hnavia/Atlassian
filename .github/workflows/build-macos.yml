@@ -2,33 +2,21 @@ name: Build macOS Executable
 
 on:
   workflow_dispatch:
+    inputs:
+      script_name:
+        description: "Script to build (from Standalone folder)"
+        required: true
+        default: "Standalone/MacroAnalyzer.py"
 
 jobs:
-  prepare-dropdown:
-    runs-on: ubuntu-latest
-    outputs:
-      script-options: ${{ steps.generate.outputs.scripts }}
+  build-macos:
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Generate script list
-        id: generate
-        run: |
-          echo "Generating list of scripts in Standalone..."
-          SCRIPTS=$(find Standalone -name '*.py' | sort | paste -sd ',' -)
-          echo "scripts=$SCRIPTS" >> $GITHUB_OUTPUT
-          echo "Available scripts: $SCRIPTS"
-
-  build-macos:
-    needs: prepare-dropdown
-    runs-on: macos-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4   # 🔄 actualizado
-
       - name: Set up Python
-        uses: actions/setup-python@v5   # 🔄 última versión
+        uses: actions/setup-python@v5
         with:
           python-version: 3.13
 
@@ -37,21 +25,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
 
-      - name: Choose script to build
-        run: |
-          echo "Available scripts in Standalone:"
-          echo "${{ needs.prepare-dropdown.outputs.script-options }}" | tr ',' '\n'
-          echo "Enter the script to build exactly as shown above:"
-          read SCRIPT_TO_BUILD
-          echo "Script chosen: $SCRIPT_TO_BUILD"
-          echo "SCRIPT_TO_BUILD=$SCRIPT_TO_BUILD" >> $GITHUB_ENV
-
       - name: Build executable
         run: |
-          pyinstaller --onefile "$SCRIPT_TO_BUILD" --distpath Standalone
+          echo "Building script: ${{ github.event.inputs.script_name }}"
+          pyinstaller --onefile "${{ github.event.inputs.script_name }}" --distpath Standalone
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4   # 🔄 actualizado
+        uses: actions/upload-artifact@v4
         with:
           name: macOS-executable
           path: Standalone/*
