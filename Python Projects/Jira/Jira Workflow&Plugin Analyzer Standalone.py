@@ -12,7 +12,6 @@ size = 25
 csv.field_size_limit(size * 1024 * 1024)
 ######################################################################
 
-
 # Function to extract data from XML
 def extract_data_from_xml(xml_data, workflow_name, keywords):
     root = eT.fromstring(xml_data)

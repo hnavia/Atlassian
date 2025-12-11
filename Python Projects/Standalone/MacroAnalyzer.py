@@ -2,6 +2,7 @@ import csv
 import os
 import time
 import threading
+import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -9,8 +10,10 @@ from requests.auth import HTTPBasicAuth
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 import webbrowser
+import sys
+import ctypes
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 # =========================
 # Utility Functions
@@ -128,14 +131,111 @@ def show_how_to(parent):
         "Notes:\n"
         " - The script uses column positions (0 and 1) — header names are ignored.\n"
         " - Plugin Name column may be empty; the CSV will contain empty plugin cells in that case.\n"
+        " - If 'Include Macro Count per page' is enabled, the script will request page storage and count macros per page (this may slow down scanning).\n"
     )
     st.insert('end', instructions)
     st.config(state='disabled')
     ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
 
 # =========================
-# Confluence Fetchers
+# Confluence Fetchers & Storage Parsing
 # =========================
+MACRO_RE = re.compile(
+    r'<ac:structured-macro[^>]*\bac:name=["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+
+def parse_macro_counts_from_storage(storage_value):
+    """
+    Given the 'value' returned in body.storage (string), return a dict macro_name -> count.
+    """
+    if not storage_value:
+        return {}
+    matches = MACRO_RE.findall(storage_value)
+    counts = {}
+    for m in matches:
+        counts[m] = counts.get(m, 0) + 1
+    return counts
+
+def fetch_page_details(session, baseurl, page_id, verify_flag, include_macro_count, is_cloud, page_cache, cache_lock):
+    """
+    Returns a dict with page metadata and, if requested, macro counts mapping under 'macro_counts'.
+    Uses page_cache to avoid duplicate storage requests for the same page.
+    """
+    # First, try to fetch minimal page metadata (history/version/space) similar to previous behavior
+    try:
+        resp = safe_request(
+            session, 'GET',
+            f'{baseurl}/rest/api/content/{page_id}',
+            params={'expand': 'history,version,space'},
+            verify=verify_flag
+        )
+        page = resp.json()
+        space_key = (page.get('space') or {}).get('key', '')
+        title = page.get('title', '')
+        history = page.get('history') or {}
+        version = page.get('version') or {}
+        creator = get_user_display(history.get('createdBy', {}))
+        created_date = format_date_safe(history.get('createdDate'))
+        last_modified_by = get_user_display(version.get('by', {}))
+        last_modified_date = format_date_safe(version.get('when'))
+        links = page.get('_links') or {}
+        webui = links.get('webui', '')
+        page_url = f'{baseurl}{webui}' if webui else ''
+    except Exception:
+        # if metadata fails, still attempt storage if counting enabled; return what we can
+        space_key = title = creator = created_date = last_modified_by = last_modified_date = page_url = ''
+
+    result = {
+        'space_key': space_key,
+        'title': title,
+        'creator': creator,
+        'created_date': created_date,
+        'last_modified_by': last_modified_by,
+        'last_modified_date': last_modified_date,
+        'page_id': str(page_id),
+        'page_url': page_url
+    }
+
+    if not include_macro_count:
+        return result
+
+    # Use cache to avoid re-fetch
+    with cache_lock:
+        cached = page_cache.get(page_id)
+    if cached is not None:
+        # cached expected structure: {'macro_counts': {...}}
+        result['macro_counts'] = cached.get('macro_counts', {})
+        return result
+
+    # fetch storage format depending on cloud or DC
+    storage_value = ''
+    try:
+        if is_cloud:
+            # Cloud v2
+            # baseurl is expected to end with /wiki (build_baseurl_for_cloud ensures that)
+            storage_url = f'{baseurl}/api/v2/pages/{page_id}?body-format=storage'
+            resp2 = safe_request(session, 'GET', storage_url, verify=verify_flag)
+            data2 = resp2.json()
+            # path may be data2['body']['storage']['value']
+            storage_value = (data2.get('body') or {}).get('storage', {}).get('value', '') or ''
+        else:
+            # Server/DC
+            resp2 = safe_request(session, 'GET', f'{baseurl}/rest/api/content/{page_id}', params={'expand': 'body.storage'}, verify=verify_flag)
+            data2 = resp2.json()
+            storage_value = (data2.get('body') or {}).get('storage', {}).get('value', '') or ''
+    except Exception:
+        storage_value = ''
+
+    macro_counts = parse_macro_counts_from_storage(storage_value)
+
+    # store in cache
+    with cache_lock:
+        page_cache[page_id] = {'macro_counts': macro_counts}
+
+    result['macro_counts'] = macro_counts
+    return result
+
 def fetch_all_results_for_macro(session, baseurl, macro, verify_ssl):
     all_results = []
     start = 0
@@ -157,40 +257,10 @@ def fetch_all_results_for_macro(session, baseurl, macro, verify_ssl):
             break
     return all_results
 
-def fetch_page_details(session, baseurl, page_id, verify_ssl):
-    resp = safe_request(
-        session, 'GET',
-        f'{baseurl}/rest/api/content/{page_id}',
-        params={'expand': 'history,version,space'},
-        verify=verify_ssl
-    )
-    page = resp.json()
-    space_key = (page.get('space') or {}).get('key', '')
-    title = page.get('title', '')
-    history = page.get('history') or {}
-    version = page.get('version') or {}
-    creator = get_user_display(history.get('createdBy', {}))
-    created_date = format_date_safe(history.get('createdDate'))
-    last_modified_by = get_user_display(version.get('by', {}))
-    last_modified_date = format_date_safe(version.get('when'))
-    links = page.get('_links') or {}
-    webui = links.get('webui', '')
-    page_url = f'{baseurl}{webui}' if webui else ''
-    return {
-        'space_key': space_key,
-        'title': title,
-        'creator': creator,
-        'created_date': created_date,
-        'last_modified_by': last_modified_by,
-        'last_modified_date': last_modified_date,
-        'page_id': str(page.get('id', '')),
-        'page_url': page_url
-    }
-
 # =========================
 # Worker Function
 # =========================
-def run_confluence_job(config, csv_input_path, verify_ssl, progress_bar, on_done_callback):
+def run_confluence_job(config, csv_input_path, verify_ssl, progress_bar, on_done_callback, include_macro_count=False):
     summary_counts = {}
     try:
         s = requests.Session()
@@ -203,17 +273,22 @@ def run_confluence_job(config, csv_input_path, verify_ssl, progress_bar, on_done
             else:
                 s.auth = (config.get('username', ''), config.get('password', ''))
             verify_flag = verify_ssl
+            is_cloud = False
         else:
             baseurl = build_baseurl_for_cloud(config['baseurl'])
             s.auth = HTTPBasicAuth(config.get('email', ''), config.get('token', ''))
-            verify_flag = True
+            verify_flag = True  # cloud: keep verify on
+            is_cloud = True
 
+        # quick probe
         safe_request(s, 'GET', f'{baseurl}/rest/api/content', verify=verify_flag)
 
+        # Read CSV tasks using fixed column coordinates (0 = plugin, 1 = macro)
         tasks = []
+        macro_list = set()
         with open(csv_input_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
-            next(reader, None)
+            next(reader, None)  # skip header (if present)
             for row in reader:
                 if not row or len(row) < 2:
                     continue
@@ -221,6 +296,7 @@ def run_confluence_job(config, csv_input_path, verify_ssl, progress_bar, on_done
                 macro = (row[1] or '').strip()
                 if macro:
                     tasks.append((plugin, macro))
+                    macro_list.add(macro)
 
         if not tasks:
             raise ValueError('No macros found in CSV (expect at least two columns: [0]=Plugin, [1]=Macro).')
@@ -231,45 +307,71 @@ def run_confluence_job(config, csv_input_path, verify_ssl, progress_bar, on_done
         output_csv_path = os.path.join(out_dir, f'{base_name}_result_{date_str}.csv')
         log_path = os.path.join(out_dir, f'{base_name}_result_{date_str}.log')
 
+        # page cache + lock for storage fetching
+        page_cache = {}
+        cache_lock = threading.Lock()
+
         with open(output_csv_path, 'w', newline='', encoding='utf-8') as out_csv:
             writer = csv.writer(out_csv)
-            writer.writerow([
-                'Plugin Name','Macro Name','Space Key','Page Title','Creator',
-                'Created Date','Last Modified by','Last Modified Date','Page ID','Page URL'
+
+            # Insert Macro Count in Page right after Macro Name (dynamic)
+            header = ['Plugin Name', 'Macro Name']
+            if include_macro_count:
+                header.append('Macro Count in Page')
+            header.extend([
+                'Space Key', 'Page Title', 'Creator',
+                'Created Date', 'Last Modified by', 'Last Modified Date', 'Page ID', 'Page URL'
             ])
+            writer.writerow(header)
 
             progress_bar['value'] = 0
             progress_bar['maximum'] = len(tasks)
 
             with ThreadPoolExecutor(max_workers=6) as pool:
+                # map each macro task to a future
                 future_map = {
                     pool.submit(fetch_all_results_for_macro, s, baseurl, macro, verify_flag): (plugin, macro)
                     for plugin, macro in tasks
                 }
+
+                # We'll submit a page-details future for each page, but fetch_page_details will use page_cache
                 for future in as_completed(future_map):
                     plugin, macro = future_map[future]
                     try:
                         results = future.result()
-                    except:
+                    except Exception:
                         results = []
+
                     summary_counts[macro] = summary_counts.get(macro, 0) + len(results)
 
+                    # for each result (page) submit a details fetch
                     page_futures = [
-                        pool.submit(fetch_page_details, s, baseurl, str(p.get('id')), verify_flag)
+                        pool.submit(fetch_page_details, s, baseurl, str(p.get('id')), verify_flag, include_macro_count, is_cloud, page_cache, cache_lock)
                         for p in results
                     ]
                     for pf in as_completed(page_futures):
                         try:
                             details = pf.result()
-                            writer.writerow([
-                                plugin, macro,
+                            # compute macro count for this macro on this page (0 if missing)
+                            macro_count = 0
+                            if include_macro_count:
+                                macro_count = int((details.get('macro_counts') or {}).get(macro, 0))
+
+                            # write rows dynamically matching header
+                            row = [plugin, macro]
+                            if include_macro_count:
+                                row.append(macro_count)
+                            row.extend([
                                 details['space_key'], details['title'], details['creator'],
                                 details['created_date'], details['last_modified_by'],
                                 details['last_modified_date'], details['page_id'], details['page_url']
                             ])
+                            writer.writerow(row)
                         except:
+                            # skip failed page fetch
                             pass
 
+                    # increment progress (simple update)
                     try:
                         progress_bar['value'] += 1
                     except:
@@ -282,7 +384,32 @@ def run_confluence_job(config, csv_input_path, verify_ssl, progress_bar, on_done
         on_done_callback(summary_text, output_csv_path, log_path)
 
     except Exception as e:
+        # show error in main thread via messagebox (this is okay)
         messagebox.showerror('Error', f'An error occurred: {e}')
+
+# ========================
+#  WINDOWS TASKBAR ICON FIX
+# ========================
+def force_taskbar_icon():
+    """
+    Ensures that Windows uses the EXE icon in the taskbar,
+    not the default Python/Tkinter icon.
+    Works only when frozen with PyInstaller.
+    """
+    try:
+        # Custom AppUserModelID (any unique string)
+        appid = u"MacroAnalyzer.App"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
+
+        if getattr(sys, "frozen", False):
+            # Load the embedded icon from the EXE
+            exe_path = sys.executable
+            ctypes.windll.kernel32.LoadLibraryW(exe_path)
+    except Exception:
+        pass  # Fail silently if not on Windows or anything goes wrong
+
+force_taskbar_icon()
+# ========================
 
 # =========================
 # Tkinter GUI
@@ -291,16 +418,23 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Confluence Macro Extractor (Server/DC & Cloud)')
+        self.iconbitmap("logo.ico")
+        # fixed size kept as before
         self.resizable(False, False)
 
+        # state variables
         self.input_csv_path = tk.StringVar(value='')
         self.verify_ssl = tk.BooleanVar(value=True)
+        # default should be No => False
+        self.include_macro_count = tk.BooleanVar(value=False)  # New option (default: No)
 
+        # Menu bar
         menu_bar = tk.Menu(self)
         self.config(menu=menu_bar)
         menu_bar.add_command(label="How To", command=lambda: show_how_to(self))
         menu_bar.add_command(label="About", command=lambda: show_about(self))
 
+        # Notebook tabs
         self.notebook = ttk.Notebook(self)
         self.tab_dc = ttk.Frame(self.notebook)
         self.tab_cloud = ttk.Frame(self.notebook)
@@ -308,10 +442,12 @@ class App(tk.Tk):
         self.notebook.add(self.tab_cloud, text='Cloud')
         self.notebook.pack(fill='x', expand=False, padx=6, pady=6)
 
+        # build UI pieces
         self._build_dc_tab(self.tab_dc)
         self._build_cloud_tab(self.tab_cloud)
         self._build_shared_io()
 
+        # progress
         bottom_frame = ttk.Frame(self)
         bottom_frame.pack(fill='x', padx=8, pady=6)
 
@@ -335,6 +471,7 @@ class App(tk.Tk):
         ttk.Radiobutton(frame, text='PAT', value='PAT', variable=self.dc_auth_mode, command=self._toggle_dc_auth).pack(side='left', padx=(0,6))
         ttk.Radiobutton(frame, text='Username + Password', value='BASIC', variable=self.dc_auth_mode, command=self._toggle_dc_auth).pack(side='left')
 
+        # Personal Access Token / username / password items (aligned as original)
         ttk.Label(parent, text='Personal Access Token:').grid(row=2, column=0, sticky='e', padx=6, pady=4)
         self.dc_pat = ttk.Entry(parent, width=50, show='*')
         self.dc_pat.grid(row=2, column=1, sticky='ew', padx=6, pady=4)
@@ -347,21 +484,39 @@ class App(tk.Tk):
         self.dc_password = ttk.Entry(parent, width=50, show='*')
         self.dc_password.grid(row=4, column=1, sticky='ew', padx=6, pady=4)
 
-        ttk.Label(parent, text='Verify SSL Certificates:').grid(row=5, column=0, sticky='e', padx=6, pady=4)
-        ssl_frame = ttk.Frame(parent); ssl_frame.grid(row=5, column=1, sticky='w', padx=6, pady=4)
+        # Include Macro Count per page (above Verify SSL) - same row numbering as original
+        ttk.Label(parent, text='Include Macro Count per page:').grid(row=5, column=0, sticky='e', padx=6, pady=4)
+        count_frame = ttk.Frame(parent); count_frame.grid(row=5, column=1, sticky='w')
+        # Yes then No (values True/False). Default var value is False so No will be selected.
+        ttk.Radiobutton(count_frame, text='Yes', value=True, variable=self.include_macro_count).pack(side='left', padx=(0,6))
+        ttk.Radiobutton(count_frame, text='No', value=False, variable=self.include_macro_count).pack(side='left')
+        ttk.Label(parent, text='(May slow down scan)', font=('TkDefaultFont', 8)).grid(row=5, column=2, sticky='w', padx=4)
+
+        ttk.Label(parent, text='Verify SSL Certificates:').grid(row=6, column=0, sticky='e', padx=6, pady=4)
+        ssl_frame = ttk.Frame(parent); ssl_frame.grid(row=6, column=1, sticky='w')
         ttk.Radiobutton(ssl_frame, text='Yes', value=True, variable=self.verify_ssl).pack(side='left', padx=(0,6))
         ttk.Radiobutton(ssl_frame, text='No', value=False, variable=self.verify_ssl).pack(side='left')
 
+        # Set initial widget states according to auth mode
         self._toggle_dc_auth()
 
     def _toggle_dc_auth(self):
+        """
+        When auth mode is PAT -> enable PAT entry, disable username/password.
+        When auth mode is BASIC -> enable username/password, disable PAT entry.
+        """
         if self.dc_auth_mode.get() == 'PAT':
             self.dc_pat.config(state='normal')
-            self.dc_user.config(state='disabled'); self.dc_password.config(state='disabled')
-            self.dc_user.delete(0, 'end'); self.dc_password.delete(0, 'end')
+            self.dc_user.config(state='disabled')
+            self.dc_password.config(state='disabled')
+            # clear username/password for security
+            self.dc_user.delete(0, 'end')
+            self.dc_password.delete(0, 'end')
         else:
             self.dc_pat.config(state='disabled')
-            self.dc_user.config(state='normal'); self.dc_password.config(state='normal')
+            self.dc_user.config(state='normal')
+            self.dc_password.config(state='normal')
+            # clear PAT for security
             self.dc_pat.delete(0, 'end')
 
     def _build_cloud_tab(self, parent):
@@ -376,6 +531,13 @@ class App(tk.Tk):
         ttk.Label(parent, text='API Token:').grid(row=2, column=0, sticky='e', padx=6, pady=4)
         self.cloud_token = ttk.Entry(parent, width=50, show='*')
         self.cloud_token.grid(row=2, column=1, sticky='ew', padx=6, pady=4)
+
+        # Include Macro Count per page (below API Token) - same variable and ordering
+        ttk.Label(parent, text='Include Macro Count per page:').grid(row=3, column=0, sticky='e', padx=6, pady=4)
+        count_frame_cloud = ttk.Frame(parent); count_frame_cloud.grid(row=3, column=1, sticky='w')
+        ttk.Radiobutton(count_frame_cloud, text='Yes', value=True, variable=self.include_macro_count).pack(side='left', padx=(0,6))
+        ttk.Radiobutton(count_frame_cloud, text='No', value=False, variable=self.include_macro_count).pack(side='left')
+        ttk.Label(parent, text='(May slow down scan)', font=('TkDefaultFont', 8)).grid(row=3, column=2, sticky='w', padx=4)
 
         parent.columnconfigure(1, weight=1)
 
@@ -414,15 +576,17 @@ class App(tk.Tk):
                 'token': self.cloud_token.get().strip()
             }
 
+        # disable start button and run worker thread
         self.btn_start.config(state='disabled')
         self.progress_label.config(text='Running...')
         threading.Thread(
             target=run_confluence_job,
-            args=(config, csv_input, self.verify_ssl.get(), self.progress, self.on_done),
+            args=(config, csv_input, self.verify_ssl.get(), self.progress, self.on_done, bool(self.include_macro_count.get())),
             daemon=True
         ).start()
 
     def on_done(self, summary_text, csv_path, log_path):
+        # called by worker thread when finished
         try:
             self.btn_start.config(state='normal')
             self.progress_label.config(text='Completed')
