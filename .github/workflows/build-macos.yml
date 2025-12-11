@@ -6,7 +6,7 @@ on:
       script:
         description: 'Script a compilar (ej: Standalone/MacroAnalyzer.py)'
         required: true
-        default: 'Python Projects/Standalone/MacroAnalyzer.py/MacroAnalyzer.py'
+        default: 'Python Projects/Standalone/MacroAnalyzer.py'
 
 jobs:
   build-macos:
